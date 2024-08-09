@@ -1,6 +1,8 @@
 import numpy as np
 from faster_whisper.audio import decode_audio
 from collections import OrderedDict
+from pathlib import Path
+import os
 
 try:
     import torch
@@ -29,12 +31,42 @@ class Diarization:
         del self.model
         torch.cuda.empty_cache()
 
+    def _load_pipeline_from_pretrained(self, path_to_config):
+        path_to_config = Path(path_to_config)
+
+        print(f"Loading pyannote pipeline from {path_to_config}...")
+
+        if not path_to_config.exists():
+            raise FileNotFoundError(f"Config file not found: {path_to_config}")
+
+        cwd = Path.cwd().resolve()
+        cd_to = path_to_config.parent.parent.resolve()
+
+        print(f"Changing working directory to {cd_to}")
+        os.chdir(cd_to)
+
+        try:
+            pipeline = Pipeline.from_pretrained(path_to_config)
+        except Exception as e:
+            print(f"Error loading pipeline: {e}")
+            print(f"Current working directory: {os.getcwd()}")
+            print(f"Contents of {cd_to}:")
+            for item in cd_to.iterdir():
+                print(f"  {item}")
+            raise
+
+        print(f"Changing working directory back to {cwd}")
+        os.chdir(cwd)
+
+        return pipeline
+
     def _load_model(self):
         model_name = "pyannote/speaker-diarization-3.1"
         device = torch.device(self.device)
-        model_handle = Pipeline.from_pretrained(
-            model_name, use_auth_token=self.use_auth_token
-        )
+
+        # we just use what w-ct2 already has in the hf_token as a path to the config file here
+        model_handle = self._load_pipeline_from_pretrained(self.use_auth_token)
+        
         if model_handle is None:
             raise ValueError(
                 f"The token Hugging Face token '{self.use_auth_token}' for diarization is not valid or you did not accept the EULA"
