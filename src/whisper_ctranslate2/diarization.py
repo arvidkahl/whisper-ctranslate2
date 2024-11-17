@@ -23,6 +23,9 @@ class Diarization:
     ):
         self.device = device
         self.use_auth_token = use_auth_token
+        
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
 
     def set_threads(self, threads):
         torch.set_num_threads(threads)
