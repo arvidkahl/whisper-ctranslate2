@@ -9,6 +9,14 @@ from .live import Live
 import sys
 import datetime
 from .commandline import CommandLine
+from .parallel_diarization import (
+    PARALLEL,
+    ParallelDiarization,
+    diarization_mode,
+    is_out_of_memory,
+    mirror_sequential_parent_state,
+)
+from .speaker_assignment import assign_speakers_from_turns
 
 
 def get_diarization(audio, diarize_model, verbose):
@@ -25,6 +33,26 @@ def get_diarization(audio, diarize_model, verbose):
 
     diarize_model.unload_model()
     return diarization_output
+
+
+def transcribe_file(
+    transcribe, audio_path, task, language, verbose, options, parallel_diarization
+):
+    """Transcribe one file. If Whisper runs out of GPU memory while the parallel
+    diarization process still holds its own, wait for that process to exit and
+    try once more: with pyannote gone, Whisper has at least the memory the
+    sequential path gives it."""
+    try:
+        return transcribe.inference(audio_path, task, language, verbose, False, options)
+    except Exception as error:
+        if parallel_diarization is None or not is_out_of_memory(error):
+            raise
+        sys.stderr.write(
+            f"Warning: transcription ran out of memory ({error}); "
+            "retrying once diarization has released its memory\n"
+        )
+        parallel_diarization.release()
+        return transcribe.inference(audio_path, task, language, verbose, False, options)
 
 
 def get_transcription_options(args):
@@ -200,6 +228,18 @@ def main():
 
         return
 
+    diarization = len(hf_token) > 0
+    diarization_device = "cpu" if device == "auto" else device
+
+    parallel_diarization = None
+    if diarization and diarization_mode() == PARALLEL:
+        # Started before the Whisper model loads: pyannote runs in its own
+        # process, with its own CUDA context, while this one transcribes.
+        parallel_diarization = ParallelDiarization(
+            audio, hf_token, diarization_device, threads, verbose
+        )
+        parallel_diarization.start()
+
     transcribe = Transcribe(
         model_dir,
         device,
@@ -210,36 +250,36 @@ def main():
         local_files_only,
     )
 
-    diarization = len(hf_token) > 0
-
-    if diarization:
+    if parallel_diarization is not None:
+        mirror_sequential_parent_state(diarization_device, threads)
+    elif diarization:
         # Import is done here then dependencies like torch are only imported if we really need diarization
         from .diarization import Diarization
 
-        diarization_device = "cpu" if device == "auto" else device
         diarize_model = Diarization(use_auth_token=hf_token, device=diarization_device)
         if threads > 0:
             diarize_model.set_threads(threads)
 
     diarization_output = {}
-    if diarization:
+    if diarization and parallel_diarization is None:
         diarization_output = get_diarization(audio, diarize_model, verbose)
 
-    # We need to do first the diarization of all files because CTranslate2 and torch
-    # use incompatible CUDA versions and once CTranslate2 is used torch will not work
+    # Sequential path (kill switch): every file is diarized before any is transcribed,
+    # as the fork always did. The parallel path collects its turns in the loop below.
     for audio_path in audio:
         try:
             if verbose and len(audio) > 1:
                 print(f"\nFile: '{audio_path} ({task})'")
 
             start_time = datetime.datetime.now()
-            result = transcribe.inference(
+            result = transcribe_file(
+                transcribe,
                 audio_path,
                 task,
                 language,
                 verbose,
-                False,
                 options,
+                parallel_diarization,
             )
 
             if diarization:
@@ -247,9 +287,16 @@ def main():
                     print(
                         f"Time used for transcription: {datetime.datetime.now() - start_time}"
                     )
-                result = diarize_model.assign_speakers_to_segments(
-                    diarization_output[audio_path], result, speaker_name
-                )
+                if parallel_diarization is not None:
+                    result = assign_speakers_from_turns(
+                        parallel_diarization.turns_for(audio_path),
+                        result,
+                        speaker_name,
+                    )
+                else:
+                    result = diarize_model.assign_speakers_to_segments(
+                        diarization_output[audio_path], result, speaker_name
+                    )
 
             writer = get_writer(output_format, output_dir)
             writer(result, audio_path, writer_args)
@@ -259,6 +306,9 @@ def main():
                 f"Error: unable to process file: {audio_path} with exception '{e}'\n"
             )
             continue
+
+    if parallel_diarization is not None:
+        parallel_diarization.finish()
 
     if verbose:
         print(f"Transcription results written to '{output_dir}' directory")
